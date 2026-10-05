@@ -1,0 +1,45 @@
+# Agent Orange — embedding Background Worker (Blueprint).
+# Create from Blueprint, paste DATABASE_URL (session pooler preferred), watch logs,
+# delete the service after the queue drains. See README_embed_worker_v1.md.
+#
+# type: worker  — no public URL, long-running process
+# plan: standard — 2 GB RAM / 1 CPU (1c-2g)
+# runtime: docker — models baked at build time
+#
+# LIMIT is intentionally unset: the worker drains offering_embed_queue, then
+# idles (IDLE_AFTER_DONE=1) so Render does not restart. Martin deletes the
+# service when done. Set LIMIT only for local/test caps (e.g. 500).
+
+services:
+  - type: worker
+    name: ao-embed-worker
+    runtime: docker
+    plan: standard
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Stop accepting new batches on SIGTERM; finish the current batch (~50 rows) and exit.
+    # 120s covers a worst-case batch of long texts + slow image hosts on 1 CPU.
+    maxShutdownDelaySeconds: 120
+    autoDeployTrigger: off
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # LIMIT unset on purpose — full drain. For a test cap, set e.g. value: "500".
+      - key: BATCH_SIZE
+        value: "50"
+      - key: MODEL_PRECISION
+        value: int8
+      # A/B on the same Standard box: set MODEL_PRECISION=fp32 (fits ~1 GB RSS in 2 GB).
+      - key: ORT_THREADS
+        value: "1"
+      - key: LOAD_MODE
+        value: both
+      - key: IDLE_AFTER_DONE
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO

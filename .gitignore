@@ -1,0 +1,23 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build / run artifacts (local only)
+out/
+models/
+*.log
+*.onnx
+*.npy
+vectors*.jsonl
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+.DS_Store

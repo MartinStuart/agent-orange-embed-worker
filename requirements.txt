@@ -1,0 +1,9 @@
+# Runtime for the Agent Orange embed worker. No torch — onnxruntime CPU only.
+# Versions match the local Starter-plan dry-run that peaked at ~411 MB RSS with
+# both int8 models loaded (text HF quantized + vision custom model_int8.onnx).
+onnxruntime==1.30.0
+tokenizers==0.23.2
+numpy==2.5.3
+Pillow==12.3.0
+psycopg[binary]==3.3.6
+requests==2.34.2

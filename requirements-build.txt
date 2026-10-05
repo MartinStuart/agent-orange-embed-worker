@@ -1,0 +1,4 @@
+# Builder-stage only (MatMulNBits quantize). Not installed in the runtime image.
+onnx==1.23.1
+onnx-ir==1.0.0
+onnxruntime==1.30.0
