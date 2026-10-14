@@ -56,12 +56,18 @@ Blueprint: `render.yaml`. Image: `Dockerfile` (models baked at build).
    the stored halfvec is ~unit length).
 4. **Shopify images:** append `?width=512` (or `&width=512`) only for
    `cdn.shopify.com`. Other hosts fetched as-is, resized locally.
-5. **Image attempt recording** (avoids retrying dead URLs):
+5. **Image attempt recording** (a failed fetch never nulls a stored image
+   vector, logic `recW2usIq5jMS1CsH`):
    - **No URL** → `image_embedding` NULL, `image_embedded_at` NULL (not attempted).
-   - **URL + success** → vector written, `image_embedded_at = now()`.
-   - **URL + fetch/embed failure** → `image_embedding` NULL,
-     `image_embedded_at = now()` so the attempt is recorded.
-   - Find failures: `image_embedded_at is not null and image_embedding is null`.
+   - **URL + success** → vector written, `image_embedded_at = now()`,
+     `image_vec_source` = the URL fetched.
+   - **URL + fetch/embed failure** → the existing `image_embedding` is left
+     untouched (a first insert, with no row yet, stores NULL).
+     `image_embedded_at = now()`, `image_vec_source` NULL.
+   - The failure is logged as
+     `image fetch failed offering_id=<id> url=<url> status=<status>`
+     so the F2 re-fetch can pick it up. The same rows match
+     `image_embedded_at is not null and image_vec_source is null`.
 6. **Write-back (one upsert, atomic):** into `public.offering_embedding`
    (PK `offering_id`) — `text_embedding`, `image_embedding`, `embedded_at=now()`,
    `image_embedded_at` per rules above, `image_vec_source` = exact URL fetched on
@@ -155,10 +161,10 @@ string if the PostgREST path is used.
 3. **PostgREST path** — column-to-column `have_hash <> want_hash` is filtered
    client-side while paging; confirm the view is exposed to the service role and
    that PATCH on `offering` with a halfvec literal works (or stick to Postgres).
-4. **Failed-image retries** — stamped rows
-   (`image_embedded_at is not null and image_embedding is null`) are left alone
-   by the queue (text_hash already matches). Say if you want a separate re-fetch
-   path later.
+4. **Failed-image retries** — a failed fetch keeps any existing image vector
+   and is logged (`offering_id`, URL, status) for the F2 re-fetch. The row is
+   also stamped with `image_embedded_at` set and `image_vec_source` null. The
+   queue itself leaves the row alone once `text_hash` matches.
 5. **fp32 A/B** — Standard fits fp32 both-loaded; say if you want a second
    service or a temporary env flip on the same box for a sample comparison.
 

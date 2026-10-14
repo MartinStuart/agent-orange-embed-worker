@@ -14,6 +14,8 @@ Modes
               SUPABASE_SERVICE_ROLE_KEY (PostgREST).
 
 Logging: progress counts, timings and row ids only. Never row text, never secrets.
+Image fetch failures also log the offering id, image URL and status so the F2
+re-fetch can pick them up.
 """
 from __future__ import annotations
 
@@ -313,6 +315,28 @@ def fetch_image_bytes(url: str) -> tuple[bytes | None, str | None]:
         return None, type(e).__name__
 
 
+def image_failure_status(err: str | None) -> str:
+    """Single status token for the F2 re-fetch log.
+
+    fetch_image_bytes reports HTTP failures as 'http <code>'. Other failures
+    ('too large', an exception class name) become one token with no spaces.
+    """
+    if not err:
+        return "error"
+    if err.startswith("http "):
+        code = err[5:].strip()
+        return code or "error"
+    return err.replace(" ", "_")
+
+
+def log_image_fetch_failure(offering_id: str, url: str, err: str | None) -> None:
+    """Greppable line: offering id, the URL that failed, and the status."""
+    log.warning(
+        "image fetch failed offering_id=%s url=%s status=%s",
+        offering_id, url, image_failure_status(err),
+    )
+
+
 def decode_image(data: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(data))  # lazy: header only
     if img.format == "JPEG":
@@ -377,6 +401,66 @@ class DryRunSource:
         pass
 
 
+def offering_embedding_upsert_sql(target_table: str | None = None) -> str:
+    """INSERT .. ON CONFLICT into offering_embedding.
+
+    v1: a failed fetch proposes image_embedding NULL. On conflict that NULL must
+    not replace the stored vector (logic recW2usIq5jMS1CsH). Rollback of this
+    behavior is reverting the commit that introduced the CASE below.
+
+    image_embedded_at set + image_embedding NULL means the fetch failed, so the
+    existing image_embedding stays. A missing URL leaves image_embedded_at NULL
+    and still writes image_embedding NULL. A new vector always wins.
+    """
+    target = target_table or TARGET_TABLE
+    # ON CONFLICT names the existing row by the unqualified table name, even
+    # when the INSERT target is schema-qualified (public.offering_embedding).
+    existing = target.rsplit(".", 1)[-1]
+    keep_existing_image = (
+        "CASE "
+        "WHEN EXCLUDED.image_embedding IS NOT NULL THEN EXCLUDED.image_embedding "
+        f"WHEN EXCLUDED.image_embedded_at IS NOT NULL THEN {existing}.image_embedding "
+        "ELSE NULL END"
+    )
+    return (
+        f"INSERT INTO {target} "
+        "(offering_id, text_embedding, image_embedding, embedded_at, "
+        " image_embedded_at, image_vec_source, text_hash, updated_at) "
+        "VALUES (%s::uuid, %s::halfvec(768), %s::halfvec(768), now(), "
+        "CASE WHEN %s THEN now() ELSE NULL END, %s, %s, now()) "
+        "ON CONFLICT (offering_id) DO UPDATE SET "
+        "text_embedding    = EXCLUDED.text_embedding, "
+        f"image_embedding   = {keep_existing_image}, "
+        "embedded_at       = EXCLUDED.embedded_at, "
+        "image_embedded_at = EXCLUDED.image_embedded_at, "
+        "image_vec_source  = EXCLUDED.image_vec_source, "
+        "updated_at        = EXCLUDED.updated_at, "
+        "text_hash         = EXCLUDED.text_hash"
+    )
+
+
+def embedding_row_body(result: dict, now: str) -> dict:
+    """PostgREST upsert body. A failed fetch omits image_embedding.
+
+    merge-duplicates updates only columns present in the body (PostgREST
+    missing=default). Omitting image_embedding leaves the stored vector in
+    place. A missing URL is not a failed fetch and sends JSON null.
+    """
+    has_img = result["image_vec"] is not None
+    attempted = bool(result.get("image_attempted"))
+    body = {
+        "offering_id": result["id"],
+        "text_embedding": to_vec_literal(result["text_vec"]),
+        "embedded_at": now,
+        "image_embedded_at": now if attempted else None,
+        "image_vec_source": result["image_src"] if has_img else None,
+        "text_hash": result["want_hash"],
+    }
+    if has_img or not attempted:
+        body["image_embedding"] = to_vec_literal(result["image_vec"]) if has_img else None
+    return body
+
+
 class PostgresSource:
     """Direct Postgres via psycopg 3. Keyset pagination by id so a row that keeps
     failing can't wedge the loop within one process run."""
@@ -421,11 +505,15 @@ class PostgresSource:
         # One transaction per batch. text_hash is written in the same statement as the
         # vectors, so a row is either fully written (and marked done) or untouched.
         #
-        # image_embedded_at:
-        #   no URL          -> NULL (not attempted)
-        #   URL + success   -> now(), image_embedding = vector
-        #   URL + fail      -> now(), image_embedding = NULL  (dead URL; do not retry)
-        # Find failed attempts: image_embedded_at IS NOT NULL AND image_embedding IS NULL
+        # image_embedded_at / image_embedding (recW2usIq5jMS1CsH, v1):
+        #   no URL          -> image_embedded_at NULL, image_embedding NULL
+        #   URL + success   -> image_embedded_at now(), image_embedding = vector
+        #   URL + fail      -> image_embedded_at now(), image_vec_source NULL,
+        #                      and the stored image_embedding is left untouched.
+        #                      A first insert (no row yet) stores NULL.
+        # Failed fetches are logged (offering id, URL, status) for the F2
+        # re-fetch. Rows to re-attempt also match
+        # image_embedded_at IS NOT NULL AND image_vec_source IS NULL.
         # 2026-10-12: vectors moved off public.offering into public.offering_embedding
         # (one row per offering, PK offering_id). offering.text_embedding /
         # image_embedding / text_hash NO LONGER EXIST, so the old UPDATE could not
@@ -437,19 +525,7 @@ class PostgresSource:
         # offering_embedding_row() trigger, but an UPDATE against a missing row
         # affects zero rows WITHOUT raising, so the worker would count it done,
         # leave text_hash unset, and meet the same row again on the next run.
-        sql = (f"INSERT INTO {TARGET_TABLE} "
-               "(offering_id, text_embedding, image_embedding, embedded_at, "
-               " image_embedded_at, image_vec_source, text_hash, updated_at) "
-               "VALUES (%s::uuid, %s::halfvec(768), %s::halfvec(768), now(), "
-               "CASE WHEN %s THEN now() ELSE NULL END, %s, %s, now()) "
-               "ON CONFLICT (offering_id) DO UPDATE SET "
-               "text_embedding    = EXCLUDED.text_embedding, "
-               "image_embedding   = EXCLUDED.image_embedding, "
-               "embedded_at       = EXCLUDED.embedded_at, "
-               "image_embedded_at = EXCLUDED.image_embedded_at, "
-               "image_vec_source  = EXCLUDED.image_vec_source, "
-               "updated_at        = EXCLUDED.updated_at, "
-               "text_hash         = EXCLUDED.text_hash")
+        sql = offering_embedding_upsert_sql(TARGET_TABLE)
         params = []
         for r in results:
             has_img = r["image_vec"] is not None
@@ -514,20 +590,13 @@ class PostgrestSource:
     def write(self, results: list[dict]):
         now = datetime.now(timezone.utc).isoformat()
         for r in results:
-            has_img = r["image_vec"] is not None
-            attempted = bool(r.get("image_attempted"))
-            body = {"text_embedding": to_vec_literal(r["text_vec"]),
-                    "image_embedding": to_vec_literal(r["image_vec"]) if has_img else None,
-                    "embedded_at": now,
-                    # Same semantics as PostgresSource: stamp attempt even when vector is null.
-                    "image_embedded_at": now if attempted else None,
-                    "image_vec_source": r["image_src"] if has_img else None,
-                    "text_hash": r["want_hash"]}
             # Upsert on offering_id, matching the Postgres path. PATCH would silently
             # match nothing if the row did not exist; merge-duplicates inserts instead.
-            body["offering_id"] = r["id"]
+            # missing=default: a failed fetch omits image_embedding so the stored
+            # vector is not overwritten with null (recW2usIq5jMS1CsH).
+            body = embedding_row_body(r, now)
             resp = self.s.post(f"{self.base}/{self.table}", data=json.dumps(body),
-                               headers={"Prefer": "return=minimal,resolution=merge-duplicates"},
+                               headers={"Prefer": "return=minimal,resolution=merge-duplicates,missing=default"},
                                timeout=60)
             resp.raise_for_status()
 
@@ -621,7 +690,7 @@ def process_batch(rows: list[dict], models: Models, pool: ThreadPoolExecutor, st
             stats["img_failed"] += 1
             res["image_attempted"] = True  # URL present; fetch failed — stamp image_embedded_at
             res["image_error"] = err
-            log.warning("image fetch failed id=%s host=%s err=%s", res["id"], urlparse(u).hostname, err)
+            log_image_fetch_failure(res["id"], u, err)
             continue
         try:
             t0 = time.perf_counter()
@@ -635,7 +704,10 @@ def process_batch(rows: list[dict], models: Models, pool: ThreadPoolExecutor, st
             stats["img_failed"] += 1
             res["image_attempted"] = True  # URL present; decode/embed failed — stamp image_embedded_at
             res["image_error"] = type(e).__name__
-            log.warning("image decode/embed failed id=%s host=%s err=%s", res["id"], urlparse(u).hostname, type(e).__name__)
+            log.warning(
+                "image decode/embed failed offering_id=%s url=%s status=%s",
+                res["id"], u, type(e).__name__,
+            )
     for fut in futures.values():  # rows skipped by STOP
         fut[1].cancel()
     return results
