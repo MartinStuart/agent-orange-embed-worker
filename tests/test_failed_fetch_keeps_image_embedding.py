@@ -1,7 +1,8 @@
-"""A failed image fetch must not null an existing image_embedding.
+"""A failed image fetch keeps the stored image vector, timestamp and source.
 
-Logic recW2usIq5jMS1CsH. The Postgres section runs the worker's upsert SQL
-(halfvec casts rewritten to text) against a scratch database.
+Logic recW2usIq5jMS1CsH. Those three columns change only when a new vector is
+written. A missing URL nulls all three. The Postgres section runs the worker's
+upsert SQL (halfvec casts rewritten to text) against a scratch database.
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import json
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import numpy as np
@@ -22,7 +24,14 @@ OID_NONE = "44444444-4444-4444-8444-444444444444"
 OID_NEW = "55555555-5555-4555-8555-555555555555"
 KEPT = "kept-image-vector"
 FETCH_URL = "https://cdn.example.com/catalog/item.jpg"
+STORED_SRC = "https://cdn.example/old.jpg"
+STORED_AT = datetime(2020, 1, 15, 12, 0, tzinfo=timezone.utc)
 TEST_DSN = os.environ.get("TEST_DATABASE_URL", "dbname=embed_upsert_test")
+NEW_VEC = np.ones(4, dtype=np.float32)
+
+
+def sql_placeholder_count(sql: str) -> int:
+    return sql.count("%s")
 
 
 def _text_sql(sql: str) -> str:
@@ -31,12 +40,6 @@ def _text_sql(sql: str) -> str:
     if out.replace("::text", "::halfvec(768)") != sql:
         raise AssertionError("halfvec cast rewrite was not exact")
     return out
-
-
-def _swap_image_assignment(sql: str, assignment: str) -> str:
-    prefix, rest = sql.split("image_embedding   = ", 1)
-    _case, suffix = rest.split(", embedded_at", 1)
-    return prefix + "image_embedding   = " + assignment + ", embedded_at" + suffix
 
 
 class _Cursor:
@@ -113,48 +116,59 @@ def _result(oid, *, image=None, attempted=False, src=None, text=None):
 
 
 class UpsertSqlTests(unittest.TestCase):
-    def test_conflict_update_keeps_stored_vector_on_failed_fetch(self):
+    def test_conflict_update_keeps_vector_timestamp_and_source(self):
         sql = worker.offering_embedding_upsert_sql("public.offering_embedding")
         self.assertIn("INSERT INTO public.offering_embedding ", sql)
+        for column in ("image_embedding", "image_embedded_at", "image_vec_source"):
+            self.assertIn(
+                "WHEN EXCLUDED.image_embedding IS NOT NULL THEN EXCLUDED." + column + " "
+                "WHEN %s THEN offering_embedding." + column + " "
+                "ELSE NULL END",
+                sql,
+            )
         self.assertNotIn("image_embedding   = EXCLUDED.image_embedding", sql)
-        self.assertIn(
-            "WHEN EXCLUDED.image_embedding IS NOT NULL THEN EXCLUDED.image_embedding "
-            "WHEN EXCLUDED.image_embedded_at IS NOT NULL THEN offering_embedding.image_embedding "
-            "ELSE NULL END",
-            sql,
-        )
+        self.assertNotIn("image_embedded_at = EXCLUDED.image_embedded_at", sql)
+        self.assertNotIn("image_vec_source  = EXCLUDED.image_vec_source", sql)
         self.assertNotIn("public.offering_embedding.image_embedding", sql)
 
-    def test_postgres_write_uses_that_sql_and_sends_null_on_failure(self):
+    def test_postgres_write_preserves_on_failure_and_writes_on_success(self):
         src = worker.PostgresSource.__new__(worker.PostgresSource)
         src.conn = _Conn()
         failed = _result(OID_KEEP, attempted=True)
-        ok = _result(OID_OK, image=np.ones(4, dtype=np.float32), attempted=True, src=FETCH_URL)
-        src.write([failed, ok])
+        missing = _result(OID_NONE, attempted=False)
+        ok = _result(OID_OK, image=NEW_VEC, attempted=True, src=FETCH_URL)
+        src.write([failed, missing, ok])
         self.assertEqual(src.conn.cur.sql, worker.offering_embedding_upsert_sql())
         self.assertEqual(src.conn.commits, 1)
-        fail_params, ok_params = src.conn.cur.params
+        fail_params, miss_params, ok_params = src.conn.cur.params
+        self.assertEqual(sql_placeholder_count(src.conn.cur.sql), len(fail_params))
         self.assertEqual(fail_params[0], OID_KEEP)
         self.assertIsNone(fail_params[2])
-        self.assertIs(fail_params[3], True)
+        self.assertIs(fail_params[3], False)
         self.assertIsNone(fail_params[4])
+        self.assertEqual(fail_params[6:], (True, True, True))
+        self.assertIs(miss_params[3], False)
+        self.assertEqual(miss_params[6:], (False, False, False))
         self.assertTrue(ok_params[2].startswith("["))
+        self.assertIs(ok_params[3], True)
         self.assertEqual(ok_params[4], FETCH_URL)
+        self.assertEqual(ok_params[6:], (False, False, False))
 
-    def test_postgrest_body_omits_image_embedding_only_on_failure(self):
+    def test_postgrest_body_omits_image_columns_on_failure(self):
         now = "2026-10-14T17:00:00+00:00"
         failed = worker.embedding_row_body(_result(OID_KEEP, attempted=True), now)
         missing = worker.embedding_row_body(_result(OID_NONE, attempted=False), now)
         ok = worker.embedding_row_body(
-            _result(OID_OK, image=np.ones(4, dtype=np.float32), attempted=True, src=FETCH_URL),
+            _result(OID_OK, image=NEW_VEC, attempted=True, src=FETCH_URL),
             now,
         )
-        self.assertNotIn("image_embedding", failed)
-        self.assertEqual(failed["image_embedded_at"], now)
-        self.assertIsNone(failed["image_vec_source"])
+        for column in ("image_embedding", "image_embedded_at", "image_vec_source"):
+            self.assertNotIn(column, failed)
         self.assertIsNone(missing["image_embedding"])
         self.assertIsNone(missing["image_embedded_at"])
+        self.assertIsNone(missing["image_vec_source"])
         self.assertTrue(ok["image_embedding"].startswith("["))
+        self.assertEqual(ok["image_embedded_at"], now)
         self.assertEqual(ok["image_vec_source"], FETCH_URL)
 
     def test_postgrest_write_posts_the_omitted_body(self):
@@ -165,8 +179,9 @@ class UpsertSqlTests(unittest.TestCase):
         src.write([_result(OID_KEEP, attempted=True)])
         post = src.s.posts[0]
         body = json.loads(post["data"])
-        self.assertNotIn("image_embedding", body)
         self.assertEqual(body["offering_id"], OID_KEEP)
+        for column in ("image_embedding", "image_embedded_at", "image_vec_source"):
+            self.assertNotIn(column, body)
         self.assertEqual(
             post["headers"]["Prefer"],
             "return=minimal,resolution=merge-duplicates,missing=default",
@@ -287,31 +302,31 @@ class PostgresUpsertTests(unittest.TestCase):
             cur.execute("TRUNCATE public.offering_embedding")
         self.conn.commit()
 
-    def _seed(self, oid, image):
+    def _seed(self, oid, image=KEPT):
         with self.conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO public.offering_embedding
                     (offering_id, text_embedding, image_embedding,
                      image_embedded_at, image_vec_source, text_hash)
-                VALUES (%s::uuid, 'old-text', %s, now() - interval '2 days',
-                        'https://cdn.example/old.jpg', 'old-hash')
+                VALUES (%s::uuid, 'old-text', %s, %s, %s, 'old-hash')
                 """,
-                (oid, image),
+                (oid, image, STORED_AT, STORED_SRC),
             )
         self.conn.commit()
 
-    def _exec(self, sql, params):
+    def _exec(self, results):
+        params = worker.offering_embedding_upsert_params(results)
+        self.assertEqual(sql_placeholder_count(self.sql), len(params[0]))
         with self.conn.cursor() as cur:
-            cur.executemany(_text_sql(sql), [params])
+            cur.executemany(_text_sql(self.sql), params)
         self.conn.commit()
 
     def _row(self, oid):
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT image_embedding, text_embedding, image_vec_source,
-                       (image_embedded_at IS NOT NULL)
+                SELECT image_embedding, text_embedding, image_vec_source, image_embedded_at
                 FROM public.offering_embedding
                 WHERE offering_id = %s::uuid
                 """,
@@ -319,48 +334,60 @@ class PostgresUpsertTests(unittest.TestCase):
             )
             return cur.fetchone()
 
-    def test_failed_fetch_keeps_vector_that_the_old_upsert_nulled(self):
-        failed = (OID_KEEP, "updated-text", None, True, None, "new-hash")
-        self._seed(OID_KEEP, KEPT)
-        self._exec(_swap_image_assignment(self.sql, "EXCLUDED.image_embedding"), failed)
-        self.assertEqual(self._row(OID_KEEP)[0], None)
-
-        self.setUp()
-        self._seed(OID_KEEP, KEPT)
-        self._exec(self.sql, failed)
-        image, text, source, attempted = self._row(OID_KEEP)
+    def test_failed_fetch_keeps_vector_timestamp_and_source(self):
+        self._seed(OID_KEEP)
+        self._exec([_result(OID_KEEP, attempted=True)])
+        image, text, source, embedded_at = self._row(OID_KEEP)
         self.assertEqual(image, KEPT)
-        self.assertEqual(text, "updated-text")
-        self.assertIsNone(source)
-        self.assertIs(attempted, True)
+        self.assertNotEqual(text, "old-text")
+        self.assertEqual(source, STORED_SRC)
+        self.assertEqual(embedded_at, STORED_AT)
 
-    def test_successful_fetch_replaces_image_embedding(self):
-        self._seed(OID_OK, KEPT)
-        self._exec(
-            self.sql,
-            (OID_OK, "updated-text", "new-image-vector", True, FETCH_URL, "new-hash"),
-        )
-        image, text, source, attempted = self._row(OID_OK)
-        self.assertEqual(image, "new-image-vector")
-        self.assertEqual(text, "updated-text")
+    def test_new_vector_updates_embedding_timestamp_and_source(self):
+        self._seed(OID_OK)
+        self._exec([_result(OID_OK, image=NEW_VEC, attempted=True, src=FETCH_URL)])
+        image, text, source, embedded_at = self._row(OID_OK)
+        self.assertEqual(image, worker.to_vec_literal(NEW_VEC))
+        self.assertNotEqual(image, KEPT)
+        self.assertNotEqual(text, "old-text")
         self.assertEqual(source, FETCH_URL)
-        self.assertIs(attempted, True)
+        self.assertNotEqual(embedded_at, STORED_AT)
+        self.assertIsNotNone(embedded_at)
+        age = abs((datetime.now(timezone.utc) - embedded_at).total_seconds())
+        self.assertLess(age, 60)
 
-    def test_missing_url_still_clears_image_embedding(self):
-        self._seed(OID_NONE, KEPT)
-        self._exec(self.sql, (OID_NONE, "updated-text", None, False, None, "new-hash"))
-        image, _text, source, attempted = self._row(OID_NONE)
+    def test_missing_url_nulls_embedding_timestamp_and_source(self):
+        self._seed(OID_NONE)
+        self._exec([_result(OID_NONE, attempted=False)])
+        image, text, source, embedded_at = self._row(OID_NONE)
         self.assertIsNone(image)
         self.assertIsNone(source)
-        self.assertIs(attempted, False)
+        self.assertIsNone(embedded_at)
+        self.assertNotEqual(text, "old-text")
 
-    def test_failed_fetch_with_no_existing_row_stores_null(self):
-        self._exec(self.sql, (OID_NEW, "updated-text", None, True, None, "new-hash"))
-        image, text, source, attempted = self._row(OID_NEW)
+    def test_failed_fetch_with_no_existing_row_stores_nulls(self):
+        self._exec([_result(OID_NEW, attempted=True)])
+        image, text, source, embedded_at = self._row(OID_NEW)
         self.assertIsNone(image)
-        self.assertEqual(text, "updated-text")
         self.assertIsNone(source)
-        self.assertIs(attempted, True)
+        self.assertIsNone(embedded_at)
+        self.assertNotEqual(text, "old-text")
+
+    def test_batch_keeps_one_row_and_rewrites_the_other(self):
+        self._seed(OID_KEEP)
+        self._seed(OID_OK)
+        self._exec([
+            _result(OID_KEEP, attempted=True),
+            _result(OID_OK, image=NEW_VEC, attempted=True, src=FETCH_URL),
+        ])
+        kept_image, _text, kept_source, kept_at = self._row(OID_KEEP)
+        new_image, _text, new_source, new_at = self._row(OID_OK)
+        self.assertEqual(kept_image, KEPT)
+        self.assertEqual(kept_source, STORED_SRC)
+        self.assertEqual(kept_at, STORED_AT)
+        self.assertEqual(new_image, worker.to_vec_literal(NEW_VEC))
+        self.assertEqual(new_source, FETCH_URL)
+        self.assertNotEqual(new_at, STORED_AT)
 
 
 if __name__ == "__main__":
